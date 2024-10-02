@@ -1,5 +1,7 @@
 import sgMail from '@sendgrid/mail';
 import client from '@sendgrid/client';
+const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
+const s3Client = new S3Client({ region: process.env.AWS_REGION });
 
 export const handler = async (event) => {
   console.log('Function started');
@@ -11,23 +13,51 @@ export const handler = async (event) => {
   client.setApiKey(apiKey);
   console.log('API key set');
 
+  async function createNewsletter(userEmail) {
 
-  async function createNewsletter() {
+    const emailAsKey = (userEmail.replace('@', '_'))+'.json';
+    // Retrieve S3 object with the email as key from the 'aidaily_replies' bucket
+    let userCustomizations = [];
+    try {
+      const getObjectParams = {
+        Bucket: 'aidaily-replies',
+        Key: emailAsKey
+      };
+      const command = new GetObjectCommand(getObjectParams);
+      const response = await s3Client.send(command);
+      const streamToString = await new Promise((resolve, reject) => {
+        const chunks = [];
+        response.Body.on('data', (chunk) => chunks.push(chunk));
+        response.Body.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+        response.Body.on('error', reject);
+      });
+      userCustomizations = JSON.parse(streamToString).replies;
+      console.log('User replies fetched: ', userCustomizations);
+    } catch (error) {
+      console.error('Error retrieving S3 object:', error);
+      userCustomizations = []; // Default to empty array if retrieval fails
+    }
 
-    const SYSTEM_PROMPT = `
-      Be friendly, interesting and scientific.
-    `;
+    const userCustomizationString = userCustomizations.map(cust => {
+      return cust.text;
+    }).join('\n - ');
+
+    const SYSTEM_PROMPT = ``;
+
     const USER_PROMPT = `
-      Pretend you are the creator of a daily email newsletter. Craft an email with basic HTML formatting, that includes the following sections:
-       - An inspirational quote
-       - A 1-2 paragraph write-up of a current event or interesting topic from technology, politics, fashion, entertainment, or science.
-       - A link to information where I can learn more about the topic above
-       - An human interest story about a real person with a relevant connection to today's newsletter topic
-       - A link to learn more about this person's work or life
-       - An embedded YouTube video I might enjoy, related to the same topic as the email so far
-       - A podcast I might enjoy listening to
-       The newsletter should be returned as the body of a simple HTML email, with no additional commentary, in a <div> container tag.
+Pretend you are the creator of a daily email newsletter. Create an email with basic HTML formatting, that includes the following sections:
+  - An inspirational quote
+  - A 2-paragraph write-up of a current event or interesting topic from technology, politics, fashion, entertainment, or science.
+  - A link to information where I can learn more about the topic above
+  - An human interest story about a real person with a relevant connection to today's newsletter topic
+  - A link to learn more about this person's work or life
+  - A link to a YouTube video I might enjoy, related to the same topic as the email so far
+  - A podcast I might enjoy listening to
+The following customizations are also requested:
+  - ${userCustomizationString}
+The response to this prompt should only the newsletter HTML, with no commentary or additional formatting. The only HTML tags allowed are: div,strong,em,blockquote,table,tr,td,tbody,h1,h2,h3,p,a.
     `;
+    console.log('Final user prompt: ', USER_PROMPT);
 
     const optionsBody = {
       model: "llama-3.1-sonar-large-128k-online",
@@ -59,8 +89,8 @@ export const handler = async (event) => {
       const response = await fetch('https://api.perplexity.ai/chat/completions', options);
       const data = await response.json();
       const responseBody = data.choices[0].message.content;
+      console.log("Perplexity response: ", JSON.stringify(data));
       const responseBodyFixed = responseBody.replace(/^```html\n|\n```$/g, '');
-      console.log(responseBodyFixed);
       return responseBodyFixed;
     } catch (err) {
       console.error('Error fetching from Perplexity API:', err);
@@ -71,13 +101,19 @@ export const handler = async (event) => {
   // Function to send email
   async function sendEmail(recipientEmail, recipientFirstName) {
     
-    const newsletterContent = await createNewsletter();
+    const newsletterContent = await createNewsletter(recipientEmail);
     
     const msg = {
-      to: recipientEmail,
-      from: 'mynews@aidaily.me',
-      subject: `Hi ${recipientFirstName}, here's your daily newsletter!`,
-      html: newsletterContent
+      from: { email: 'mynews@aidaily.me' },
+      replyTo: { email: 'reply@reply.aidaily.me' },
+      personalizations: [{
+        to: [{ email: recipientEmail }],
+        dynamic_template_data: {
+          customSubject: `Hi ${recipientFirstName}, here&apos;s your daily newsletter!`,
+          newsletterContent: newsletterContent
+        }
+      }],
+      template_id: 'd-5ba05dd18198489c9936437081d0b09c',
     };
 
     console.log('Sending email with payload:', JSON.stringify(msg, null, 2));
@@ -86,7 +122,7 @@ export const handler = async (event) => {
       await sgMail.send(msg);
       return 'Email sent successfully';
     } catch (error) {
-      throw new Error('Error sending email');
+      throw new Error('SendGrid error sending email: ' + error);
     }
   }
 
@@ -133,7 +169,7 @@ export const handler = async (event) => {
         console.log(`Email sent successfully to ${contact.email}`);
       } catch (error) {
         results.push({ email: contact.email, status: 'error', message: error.message });
-        console.error(`Failed to send email to ${contact.email}:`, error.message);
+        console.error(`Failed to send email to ${contact.email}:`, error);
       }
     }
 
